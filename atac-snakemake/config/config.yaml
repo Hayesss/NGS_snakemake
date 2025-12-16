@@ -1,0 +1,162 @@
+# =============================================================================
+# ATAC-seq Snakemake Pipeline Configuration
+# =============================================================================
+# Converted from original bash scripts (ngs00-atac-server)
+# Author: Converted by Snakemake
+# =============================================================================
+
+# =============================================================================
+# Sample Configuration
+# =============================================================================
+# Sample sheet with columns: sample_name, gsm_id, srr_id, group (optional)
+samples: "config/samples.tsv"
+
+# =============================================================================
+# Input/Output Paths
+# =============================================================================
+# Raw data directory (containing GSM subdirectories with fastq.gz files)
+raw_data_dir: "/home/data/public_data/atac_demo"
+
+# Output directory for single-sample analysis
+output_dir: "results"
+
+# Output directory for downstream (group-level) analysis
+output_dir_downstream: "results_ds"
+
+# =============================================================================
+# Reference Files
+# =============================================================================
+reference:
+  # Bowtie2 index prefix (without .bt2 extension)
+  bowtie2_index: "reference/bowtie2_GRCh38_primary/genome"
+  
+  # Chromosome sizes file (tab-separated: chrom\tsize)
+  chrom_sizes: "reference/GRCh38_chrom.sizes.tsv"
+  
+  # Blacklist regions (ENCODE blacklist v2)
+  # Download: https://github.com/Boyle-Lab/Blacklist
+  blacklist: "reference/hg38-blacklist.v2.bed"
+  
+  # TSS annotation for enrichment score calculation
+  # BED6 format with TSS regions (typically ±2kb around TSS)
+  tss_bed: "reference/ENCODE-GRCh38-V29-TSS.4k.bed"
+  
+  # Effective genome size for MACS2 (hg38)
+  # See: https://deeptools.readthedocs.io/en/develop/content/feature/effectiveGenomeSize.html
+  # hg38 (GRCh38): 2913022398
+  # hg19 (GRCh37): 2864785220
+  # mm10 (GRCm38): 2652783500
+  # mm9: 2620345972
+  effective_genome_size: 2913022398
+
+# =============================================================================
+# Cutadapt (Adapter Trimming) Parameters
+# =============================================================================
+cutadapt:
+  # Adapter sequences (Nextera Tn5 transposase adapters)
+  # Standard Nextera adapter: CTGTCTCTTATA
+  adapter1: "CTGTCTCTTATA"
+  adapter2: "CTGTCTCTTATA"
+  
+  # Quality score cutoff for 3' end trimming (Phred scale)
+  quality_cutoff: 30
+  
+  # Minimum read length after trimming (discard shorter reads)
+  min_length: 16
+
+# =============================================================================
+# Bowtie2 Alignment Parameters
+# =============================================================================
+bowtie2:
+  # Extra parameters for bowtie2
+  # --very-sensitive: recommended for ATAC-seq for high-quality alignments
+  # -X 2000: allow fragments up to 2000bp (captures nucleosome patterns)
+  extra: "--very-sensitive -X 2000"
+
+# =============================================================================
+# Filtering Parameters
+# =============================================================================
+filtering:
+  # Minimum mapping quality (MAPQ)
+  # 10: ~10% chance of incorrect mapping
+  # 30: ~0.1% chance of incorrect mapping
+  min_mapq: 10
+
+# =============================================================================
+# Tn5 Shift Parameters
+# =============================================================================
+tn5_shift:
+  # Extend N bp upstream and downstream relative to the Tn5 cut site
+  # Default 25 bp creates 50 bp windows centered on cut sites
+  extend: 25
+
+# =============================================================================
+# MACS2 Peak Calling Parameters
+# =============================================================================
+macs2:
+  # Q-value (FDR) cutoff for peak calling
+  # 0.01 is stringent, 0.05 is more permissive
+  qvalue: 0.01
+
+# =============================================================================
+# Peak QC Parameters
+# =============================================================================
+peak_qc:
+  # Q-value threshold for peak filtering
+  q_thresh: 0.05
+
+# =============================================================================
+# Summit Integration Parameters
+# =============================================================================
+summit:
+  # Bandwidth (bp) to extend summits for merging
+  bandwidth: 250
+
+# =============================================================================
+# HOMER Motif Analysis Parameters (Optional)
+# =============================================================================
+homer:
+  # Reference genome
+  genome: "hg38"
+  # Region size around peak centers for motif finding
+  size: 100
+  # Motif lengths to search (comma-separated)
+  motif_len: "5,6,7,8,9,10"
+
+# =============================================================================
+# DeepTools Visualization Parameters (Optional)
+# =============================================================================
+deeptools:
+  # Upstream distance from reference point
+  upstream: 3000
+  # Downstream distance from reference point
+  downstream: 3000
+  # Color gradient for heatmap
+  color: "white,#0066CC"
+  # Heatmap dimensions
+  height: 12
+  width: 6
+  # Region files for visualization (BED format)
+  # Update these paths based on your analysis
+  regions: []
+
+# =============================================================================
+# RGT-HINT Footprinting Parameters (Optional)
+# =============================================================================
+rgt:
+  # Reference organism
+  organism: "hg38"
+
+# =============================================================================
+# Resource Settings (threads per rule)
+# =============================================================================
+threads:
+  fastqc: 2
+  cutadapt: 4
+  bowtie2: 8
+  samtools_sort: 8
+  picard: 4
+  macs2: 1
+  homer: 4
+  deeptools: 10
+  default: 1

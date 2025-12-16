@@ -1,0 +1,28 @@
+# =============================================================================
+# Sample Configuration for ATAC-seq Pipeline
+# =============================================================================
+# Columns:
+#   sample_name: Unique sample identifier used for output files
+#   gsm_id:      GEO sample accession (directory name in raw_data_dir)
+#   srr_id:      SRA run accession (fastq file prefix)
+#   group:       Sample group for downstream analysis (optional)
+#                Samples with the same group name will be merged together
+#
+# Notes:
+#   - File format: Tab-separated values (TSV)
+#   - Lines starting with # are comments
+#   - The group column enables downstream analysis (merging replicates, etc.)
+#   - Leave group empty if downstream analysis is not needed
+#
+# Example with multiple cell types and replicates:
+# sample_name	gsm_id	srr_id	group
+# HSC_4983_rep1	GSM1937376	SRR2920466	HSC
+# HSC_4983_rep2	GSM1937378	SRR2920468	HSC
+# MPP_4983_rep1	GSM1937377	SRR2920467	MPP
+# MPP_4983_rep2	GSM1937379	SRR2920469	MPP
+# CMP_4983_rep1	GSM1937380	SRR2920470	CMP
+# GMP_4983_rep1	GSM1937382	SRR2920472	GMP
+# Mono_4983_rep1	GSM1937384	SRR2920474	Mono
+# =============================================================================
+sample_name	gsm_id	srr_id	group
+HSC_4983_rep1	GSM1937376	SRR2920466	HSC

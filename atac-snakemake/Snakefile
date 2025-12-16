@@ -1,0 +1,842 @@
+# =============================================================================
+# ATAC-seq Analysis Pipeline (Snakemake)
+# =============================================================================
+# Converted from bash scripts (ngs00-atac-server)
+# 
+# Pipeline Steps (Single Sample Processing):
+#   01. FastQC (raw reads) + MultiQC
+#   02. Cutadapt (adapter trimming)
+#   03. FastQC (clean reads) + MultiQC
+#   04. Bowtie2 alignment
+#   05. Filter (remove chrM, low quality, proper pairs)
+#   06. Picard MarkDuplicates
+#   07. Tn5 shift (+4/-5)
+#   08. Normalize and generate BigWig
+#   09. QC metrics
+#   10. MACS2 peak calling
+#   11. Nucleosome positioning
+#   12. Count table generation
+#
+# Downstream Analysis (Group-level):
+#   DS01. Merge replicates (BED files)
+#   DS02. Group peak calling
+#   DS03. Summit filtration and integration
+#   DS04. Count table on merged peaks
+#   DS05. Merge BAM files by group
+#   DS06. Generate group BigWig tracks
+#   DS07. Motif enrichment (HOMER) - optional
+#   DS08. DeepTools visualization - optional
+#   DS09. TF footprinting (RGT-HINT) - optional
+# =============================================================================
+
+import pandas as pd
+from pathlib import Path
+
+# Load configuration
+configfile: "config/config.yaml"
+
+# =============================================================================
+# Load Sample Information
+# =============================================================================
+samples_df = pd.read_csv(config["samples"], sep="\t", comment="#")
+SAMPLES = samples_df["sample_name"].tolist()
+SAMPLE_INFO = samples_df.set_index("sample_name").to_dict("index")
+
+# Get unique groups from sample sheet
+if "group" in samples_df.columns:
+    GROUPS = samples_df["group"].dropna().unique().tolist()
+else:
+    GROUPS = []
+
+# Output directories
+OUTDIR = config["output_dir"]
+OUTDIR_DS = config.get("output_dir_downstream", "results_ds")
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+def get_raw_fastq(wildcards, read):
+    """Get raw fastq file path for a sample."""
+    info = SAMPLE_INFO[wildcards.sample]
+    return f"{config['raw_data_dir']}/{info['gsm_id']}/{info['srr_id']}_{read}.fastq.gz"
+
+def get_all_raw_fastqs():
+    """Get all raw fastq files for FastQC."""
+    fastqs = []
+    for sample in SAMPLES:
+        info = SAMPLE_INFO[sample]
+        for read in [1, 2]:
+            fastqs.append(f"{config['raw_data_dir']}/{info['gsm_id']}/{info['srr_id']}_{read}.fastq.gz")
+    return fastqs
+
+def get_samples_in_group(group):
+    """Get all sample names belonging to a group."""
+    return samples_df[samples_df["group"] == group]["sample_name"].tolist()
+
+def get_group_shift_beds(wildcards):
+    """Get all shift BED files for samples in a group."""
+    samples = get_samples_in_group(wildcards.group)
+    return [f"{OUTDIR}/07-shift/{s}.shift.bed" for s in samples]
+
+def get_group_dedup_bams(wildcards):
+    """Get all dedup BAM files for samples in a group."""
+    samples = get_samples_in_group(wildcards.group)
+    return [f"{OUTDIR}/06-dedup/{s}.dedup.bam" for s in samples]
+
+# =============================================================================
+# Target Rules
+# =============================================================================
+rule all:
+    input:
+        # FastQC reports (raw)
+        f"{OUTDIR}/01-fastqc_raw_multiqc/multiqc_report.html",
+        # FastQC reports (clean)
+        f"{OUTDIR}/03-fastqc_clean_multiqc/multiqc_report.html",
+        # Final BigWig files
+        expand(f"{OUTDIR}/08-normalize/{{sample}}.norm.bw", sample=SAMPLES),
+        # QC tables
+        expand(f"{OUTDIR}/09-qc/{{sample}}.QC.table.txt", sample=SAMPLES),
+        # Peak files
+        expand(f"{OUTDIR}/10-peaks/{{sample}}/{{sample}}_peaks.narrowPeak.Q0.05.rm_blacklist.bed", sample=SAMPLES),
+        # Nucleosome positioning
+        expand(f"{OUTDIR}/11-nucleosome/{{sample}}.nf.bw", sample=SAMPLES),
+        expand(f"{OUTDIR}/11-nucleosome/{{sample}}.neu.bw", sample=SAMPLES),
+        # Count tables (per sample peaks)
+        expand(f"{OUTDIR}/12-counts/{{sample}}.readcount", sample=SAMPLES),
+
+# Target rule for downstream analysis
+rule all_downstream:
+    input:
+        # Merged shift BED files by group
+        expand(f"{OUTDIR_DS}/01-merge/{{group}}.bed", group=GROUPS) if GROUPS else [],
+        # Group peak calling results
+        expand(f"{OUTDIR_DS}/02-peaks/{{group}}/{{group}}_peaks.narrowPeak.Q0.05.rm_blacklist.bed", group=GROUPS) if GROUPS else [],
+        # Merged summit file
+        f"{OUTDIR_DS}/02-peaks/merged_summits.rename.bed" if GROUPS else [],
+        # Merged count matrix
+        f"{OUTDIR_DS}/04-counts/counts.tsv" if GROUPS else [],
+        # Group BigWig tracks
+        expand(f"{OUTDIR_DS}/05-tracks/{{group}}.norm.bw", group=GROUPS) if GROUPS else [],
+        # Merged BAM files (sorted and indexed)
+        expand(f"{OUTDIR_DS}/06-merge_bam/{{group}}.sort.bam.bai", group=GROUPS) if GROUPS else [],
+
+# =============================================================================
+# Rule 01: FastQC on Raw Reads
+# =============================================================================
+rule fastqc_raw:
+    input:
+        fq = get_all_raw_fastqs()
+    output:
+        directory(f"{OUTDIR}/01-fastqc_raw")
+    threads: config["threads"]["fastqc"]
+    log:
+        f"{OUTDIR}/logs/01-fastqc_raw.log"
+    shell:
+        """
+        mkdir -p {output}
+        fastqc {input.fq} -o {output} -t {threads} 2>&1 | tee {log}
+        """
+
+rule multiqc_raw:
+    input:
+        f"{OUTDIR}/01-fastqc_raw"
+    output:
+        f"{OUTDIR}/01-fastqc_raw_multiqc/multiqc_report.html"
+    params:
+        outdir = f"{OUTDIR}/01-fastqc_raw_multiqc"
+    log:
+        f"{OUTDIR}/logs/01-multiqc_raw.log"
+    shell:
+        """
+        multiqc -f -d {input} -o {params.outdir} 2>&1 | tee {log}
+        """
+
+
+# =============================================================================
+# Rule 02: Cutadapt Trimming
+# =============================================================================
+rule cutadapt:
+    input:
+        r1 = lambda wc: get_raw_fastq(wc, 1),
+        r2 = lambda wc: get_raw_fastq(wc, 2)
+    output:
+        r1 = f"{OUTDIR}/02-clean_fastq/{{sample}}_1.fastq.gz",
+        r2 = f"{OUTDIR}/02-clean_fastq/{{sample}}_2.fastq.gz",
+        log_file = f"{OUTDIR}/02-clean_fastq/{{sample}}.cutadapt.log"
+    params:
+        adapter1 = config["cutadapt"]["adapter1"],
+        adapter2 = config["cutadapt"]["adapter2"],
+        quality = config["cutadapt"]["quality_cutoff"],
+        minlen = config["cutadapt"]["min_length"]
+    threads: config["threads"]["cutadapt"]
+    log:
+        f"{OUTDIR}/logs/02-cutadapt_{{sample}}.log"
+    shell:
+        """
+        cutadapt -j {threads} \
+            -a {params.adapter1} -A {params.adapter2} \
+            -q {params.quality} -m {params.minlen} \
+            -o {output.r1} -p {output.r2} \
+            {input.r1} {input.r2} > {output.log_file} 2>&1
+        """
+
+
+# =============================================================================
+# Rule 03: FastQC on Clean Reads
+# =============================================================================
+rule fastqc_clean:
+    input:
+        fq = expand(f"{OUTDIR}/02-clean_fastq/{{sample}}_{{read}}.fastq.gz", 
+                   sample=SAMPLES, read=[1, 2])
+    output:
+        directory(f"{OUTDIR}/03-fastqc_clean")
+    threads: config["threads"]["fastqc"]
+    log:
+        f"{OUTDIR}/logs/03-fastqc_clean.log"
+    shell:
+        """
+        mkdir -p {output}
+        fastqc {input.fq} -o {output} -t {threads} 2>&1 | tee {log}
+        """
+
+rule multiqc_clean:
+    input:
+        f"{OUTDIR}/03-fastqc_clean"
+    output:
+        f"{OUTDIR}/03-fastqc_clean_multiqc/multiqc_report.html"
+    params:
+        outdir = f"{OUTDIR}/03-fastqc_clean_multiqc"
+    log:
+        f"{OUTDIR}/logs/03-multiqc_clean.log"
+    shell:
+        """
+        multiqc -f -d {input} -o {params.outdir} 2>&1 | tee {log}
+        """
+
+
+# =============================================================================
+# Rule 04: Bowtie2 Alignment
+# =============================================================================
+rule bowtie2_align:
+    input:
+        r1 = f"{OUTDIR}/02-clean_fastq/{{sample}}_1.fastq.gz",
+        r2 = f"{OUTDIR}/02-clean_fastq/{{sample}}_2.fastq.gz"
+    output:
+        sam = temp(f"{OUTDIR}/04-align/{{sample}}.sam"),
+        log_file = f"{OUTDIR}/04-align/{{sample}}.bowtie2.log"
+    params:
+        index = config["reference"]["bowtie2_index"],
+        extra = config["bowtie2"]["extra"]
+    threads: config["threads"]["bowtie2"]
+    log:
+        f"{OUTDIR}/logs/04-bowtie2_{{sample}}.log"
+    shell:
+        """
+        bowtie2 -p {threads} {params.extra} \
+            -x {params.index} \
+            -1 {input.r1} -2 {input.r2} \
+            -S {output.sam} 2>{output.log_file}
+        """
+
+
+# =============================================================================
+# Rule 05: Filter (remove chrM, low quality reads, proper pairs only)
+# =============================================================================
+rule filter_reads:
+    input:
+        sam = f"{OUTDIR}/04-align/{{sample}}.sam"
+    output:
+        bam = temp(f"{OUTDIR}/05-filter/{{sample}}.q10.bam"),
+        mito_bam = f"{OUTDIR}/05-filter/{{sample}}.mito.bam",
+        sorted_bam = temp(f"{OUTDIR}/05-filter/{{sample}}.q10.sort.bam")
+    params:
+        mapq = config["filtering"]["min_mapq"]
+    threads: config["threads"]["samtools_sort"]
+    log:
+        f"{OUTDIR}/logs/05-filter_{{sample}}.log"
+    shell:
+        """
+        # Filter non-mitochondrial reads with proper pairs and quality >= min_mapq
+        awk '$3!="chrM" || NF<10' {input.sam} | \
+            samtools view -S -b -f 0x2 -q {params.mapq} - > {output.bam} 2>{log}
+        
+        # Extract mitochondrial reads for QC (with same quality filter)
+        awk '$3=="chrM" || NF<10' {input.sam} | \
+            samtools view -S -b -f 0x2 -q {params.mapq} - > {output.mito_bam} 2>>{log}
+        
+        # Sort BAM file
+        samtools sort -@ {threads} -o {output.sorted_bam} {output.bam} 2>>{log}
+        """
+
+
+# =============================================================================
+# Rule 06: Remove PCR Duplicates (Picard MarkDuplicates)
+# =============================================================================
+rule mark_duplicates:
+    input:
+        bam = f"{OUTDIR}/05-filter/{{sample}}.q10.sort.bam"
+    output:
+        bam = f"{OUTDIR}/06-dedup/{{sample}}.dedup.bam",
+        bai = f"{OUTDIR}/06-dedup/{{sample}}.dedup.bam.bai",
+        metrics = f"{OUTDIR}/06-dedup/{{sample}}.picard_metrics.txt",
+        log_file = f"{OUTDIR}/06-dedup/{{sample}}.picard.log"
+    params:
+        tmpdir = f"{OUTDIR}/tmp"
+    threads: config["threads"]["picard"]
+    log:
+        f"{OUTDIR}/logs/06-dedup_{{sample}}.log"
+    shell:
+        """
+        mkdir -p {params.tmpdir}
+        
+        picard MarkDuplicates \
+            I={input.bam} \
+            O={output.bam} \
+            M={output.metrics} \
+            TMP_DIR={params.tmpdir} \
+            VALIDATION_STRINGENCY=LENIENT \
+            ASSUME_SORTED=true \
+            REMOVE_DUPLICATES=true 2>{output.log_file}
+        
+        samtools index {output.bam}
+        """
+
+
+# =============================================================================
+# Rule 07: Tn5 Shift (+4/-5 bp)
+# =============================================================================
+rule tn5_shift:
+    input:
+        bam = f"{OUTDIR}/06-dedup/{{sample}}.dedup.bam"
+    output:
+        bed = f"{OUTDIR}/07-shift/{{sample}}.shift.bed"
+    params:
+        extend = config.get("tn5_shift", {}).get("extend", 25)
+    log:
+        f"{OUTDIR}/logs/07-shift_{{sample}}.log"
+    shell:
+        """
+        python workflow/scripts/bam2bedshift.py {input.bam} {output.bed} {params.extend} 2>&1 | tee {log}
+        """
+
+
+# =============================================================================
+# Rule 08: Normalize and Generate BigWig
+# =============================================================================
+rule normalize_bedgraph:
+    input:
+        bed = f"{OUTDIR}/07-shift/{{sample}}.shift.bed"
+    output:
+        bedgraph = temp(f"{OUTDIR}/08-normalize/{{sample}}.bedGraph"),
+        norm_bedgraph = temp(f"{OUTDIR}/08-normalize/{{sample}}.norm.bedGraph"),
+        bw = f"{OUTDIR}/08-normalize/{{sample}}.norm.bw"
+    params:
+        chrom_sizes = config["reference"]["chrom_sizes"]
+    log:
+        f"{OUTDIR}/logs/08-normalize_{{sample}}.log"
+    shell:
+        """
+        # Sort BED file first (required for genomeCoverageBed)
+        sort -k1,1V -k2,2n {input.bed} > {input.bed}.sorted
+        
+        # BED -> BedGraph
+        genomeCoverageBed -bg -split -i {input.bed}.sorted -g {params.chrom_sizes} > {output.bedgraph} 2>{log}
+        
+        # Normalize BedGraph (to 10 million reads)
+        python workflow/scripts/normalizebedGraph.py {output.bedgraph} {output.norm_bedgraph} 2>>{log}
+        
+        # Sort and convert to BigWig
+        sort -k1,1 -k2,2n {output.norm_bedgraph} -o {output.norm_bedgraph}
+        bedGraphToBigWig {output.norm_bedgraph} {params.chrom_sizes} {output.bw} 2>>{log}
+        
+        # Cleanup
+        rm -f {input.bed}.sorted
+        """
+
+
+# =============================================================================
+# Rule 09: QC Metrics
+# =============================================================================
+rule atac_qc:
+    input:
+        align_log = f"{OUTDIR}/04-align/{{sample}}.bowtie2.log",
+        mito_bam = f"{OUTDIR}/05-filter/{{sample}}.mito.bam",
+        dedup_bam = f"{OUTDIR}/06-dedup/{{sample}}.dedup.bam",
+        shift_bed = f"{OUTDIR}/07-shift/{{sample}}.shift.bed",
+        picard_log = f"{OUTDIR}/06-dedup/{{sample}}.picard.log"
+    output:
+        qc_table = f"{OUTDIR}/09-qc/{{sample}}.QC.table.txt",
+        frag_dist = f"{OUTDIR}/09-qc/{{sample}}.QC.fragment_distribution.png",
+        tss_enrich = f"{OUTDIR}/09-qc/{{sample}}.QC.tss_enrichment_score.png"
+    params:
+        blacklist = config["reference"]["blacklist"],
+        tss_bed = config["reference"]["tss_bed"]
+    log:
+        f"{OUTDIR}/logs/09-qc_{{sample}}.log"
+    shell:
+        """
+        python workflow/scripts/atac-qc.py \
+            {output.qc_table} \
+            {output.frag_dist} \
+            {output.tss_enrich} \
+            {wildcards.sample} \
+            {input.align_log} \
+            {input.mito_bam} \
+            {input.dedup_bam} \
+            {input.shift_bed} \
+            {params.blacklist} \
+            {input.picard_log} \
+            {params.tss_bed} 2>&1 | tee {log}
+        """
+
+
+# =============================================================================
+# Rule 10: MACS2 Peak Calling
+# =============================================================================
+rule macs2_callpeak:
+    input:
+        bed = f"{OUTDIR}/07-shift/{{sample}}.shift.bed"
+    output:
+        narrowpeak = f"{OUTDIR}/10-peaks/{{sample}}/{{sample}}_peaks.narrowPeak",
+        summits = f"{OUTDIR}/10-peaks/{{sample}}/{{sample}}_summits.bed"
+    params:
+        outdir = f"{OUTDIR}/10-peaks/{{sample}}",
+        genome_size = config["reference"]["effective_genome_size"],
+        qvalue = config["macs2"]["qvalue"]
+    threads: config["threads"]["macs2"]
+    log:
+        f"{OUTDIR}/logs/10-macs2_{{sample}}.log"
+    shell:
+        """
+        macs2 callpeak \
+            -t {input.bed} \
+            -f BED \
+            -g {params.genome_size} \
+            --outdir {params.outdir} \
+            -q {params.qvalue} \
+            -n {wildcards.sample} \
+            --nomodel --shift 0 2>&1 | tee {log}
+        """
+
+rule peak_qc:
+    input:
+        peak = f"{OUTDIR}/10-peaks/{{sample}}/{{sample}}_peaks.narrowPeak"
+    output:
+        filtered = f"{OUTDIR}/10-peaks/{{sample}}/{{sample}}_peaks.narrowPeak.Q0.05.bed",
+        clean = f"{OUTDIR}/10-peaks/{{sample}}/{{sample}}_peaks.narrowPeak.Q0.05.rm_blacklist.bed"
+    params:
+        blacklist = config["reference"]["blacklist"],
+        q_thresh = config.get("peak_qc", {}).get("q_thresh", 0.05)
+    log:
+        f"{OUTDIR}/logs/10-peak_qc_{{sample}}.log"
+    shell:
+        """
+        # Calculate -log10(q_thresh)
+        Q_THRESH_TRANSFORMED=$(awk -v p={params.q_thresh} 'BEGIN{{print -log(p)/log(10)}}')
+        
+        # Filter peaks by q-value
+        awk -v thresh=$Q_THRESH_TRANSFORMED 'BEGIN{{OFS="\\t"}} $9>=thresh {{print $1,$2,$3,$4,$5,$6,$7,$8,$9,$10}}' \
+            {input.peak} | sort -k7n,7n > {output.filtered}
+        
+        # Remove blacklist regions and non-standard chromosomes
+        bedtools intersect -v -a {output.filtered} -b {params.blacklist} | \
+            grep -P 'chr[\\dXY]+[ \\t]' > {output.clean} || true
+        
+        sort -k1,1 -k2,2n {output.clean} -o {output.clean}
+        """
+
+
+# =============================================================================
+# Rule 11: Nucleosome Positioning
+# =============================================================================
+rule nucleosome_positioning:
+    input:
+        bed = f"{OUTDIR}/07-shift/{{sample}}.shift.bed"
+    output:
+        nf_bed = f"{OUTDIR}/11-nucleosome/{{sample}}.nf.bed",
+        neu_bed = f"{OUTDIR}/11-nucleosome/{{sample}}.neu.bed",
+        nf_bw = f"{OUTDIR}/11-nucleosome/{{sample}}.nf.bw",
+        neu_bw = f"{OUTDIR}/11-nucleosome/{{sample}}.neu.bw"
+    params:
+        chrom_sizes = config["reference"]["chrom_sizes"]
+    log:
+        f"{OUTDIR}/logs/11-nucleosome_{{sample}}.log"
+    shell:
+        """
+        python workflow/scripts/generate_nucleosome_track.py \
+            {input.bed} \
+            {output.nf_bed} \
+            {output.neu_bed} \
+            {params.chrom_sizes} 2>&1 | tee {log}
+        """
+
+
+# =============================================================================
+# Rule 12: Count Table Generation (per-sample peaks)
+# =============================================================================
+rule count_table:
+    input:
+        bed = f"{OUTDIR}/07-shift/{{sample}}.shift.bed",
+        peak = f"{OUTDIR}/10-peaks/{{sample}}/{{sample}}_peaks.narrowPeak.Q0.05.rm_blacklist.bed"
+    output:
+        count = f"{OUTDIR}/12-counts/{{sample}}.readcount"
+    params:
+        outdir = f"{OUTDIR}/12-counts"
+    log:
+        f"{OUTDIR}/logs/12-counts_{{sample}}.log"
+    shell:
+        """
+        mkdir -p {params.outdir}
+        python workflow/scripts/countTable.py \
+            {input.bed} \
+            {input.peak} \
+            {params.outdir} \
+            {wildcards.sample} 2>&1 | tee {log}
+        """
+
+
+# =============================================================================
+# =============================================================================
+# DOWNSTREAM ANALYSIS (Group-level processing)
+# =============================================================================
+# =============================================================================
+
+# =============================================================================
+# DS01: Merge Replicates (BED files by group)
+# =============================================================================
+rule merge_replicates_bed:
+    input:
+        beds = get_group_shift_beds
+    output:
+        merged = f"{OUTDIR_DS}/01-merge/{{group}}.bed"
+    log:
+        f"{OUTDIR_DS}/logs/ds01-merge_{{group}}.log"
+    shell:
+        """
+        mkdir -p $(dirname {output.merged})
+        cat {input.beds} > {output.merged} 2>{log}
+        """
+
+
+# =============================================================================
+# DS02: Group Peak Calling
+# =============================================================================
+rule group_peak_calling:
+    input:
+        bed = f"{OUTDIR_DS}/01-merge/{{group}}.bed"
+    output:
+        narrowpeak = f"{OUTDIR_DS}/02-peaks/{{group}}/{{group}}_peaks.narrowPeak",
+        summits = f"{OUTDIR_DS}/02-peaks/{{group}}/{{group}}_summits.bed"
+    params:
+        outdir = f"{OUTDIR_DS}/02-peaks/{{group}}",
+        genome_size = config["reference"]["effective_genome_size"],
+        qvalue = config["macs2"]["qvalue"]
+    log:
+        f"{OUTDIR_DS}/logs/ds02-peaks_{{group}}.log"
+    shell:
+        """
+        macs2 callpeak \
+            -t {input.bed} \
+            -f BED \
+            -g {params.genome_size} \
+            --outdir {params.outdir} \
+            -q {params.qvalue} \
+            -n {wildcards.group} \
+            --nomodel --shift 0 2>&1 | tee {log}
+        """
+
+rule group_peak_qc:
+    input:
+        peak = f"{OUTDIR_DS}/02-peaks/{{group}}/{{group}}_peaks.narrowPeak"
+    output:
+        filtered = f"{OUTDIR_DS}/02-peaks/{{group}}/{{group}}_peaks.narrowPeak.Q0.05.bed",
+        clean = f"{OUTDIR_DS}/02-peaks/{{group}}/{{group}}_peaks.narrowPeak.Q0.05.rm_blacklist.bed"
+    params:
+        blacklist = config["reference"]["blacklist"],
+        q_thresh = config.get("peak_qc", {}).get("q_thresh", 0.05)
+    log:
+        f"{OUTDIR_DS}/logs/ds02-peak_qc_{{group}}.log"
+    shell:
+        """
+        Q_THRESH_TRANSFORMED=$(awk -v p={params.q_thresh} 'BEGIN{{print -log(p)/log(10)}}')
+        
+        awk -v thresh=$Q_THRESH_TRANSFORMED 'BEGIN{{OFS="\\t"}} $9>=thresh {{print $1,$2,$3,$4,$5,$6,$7,$8,$9,$10}}' \
+            {input.peak} | sort -k7n,7n > {output.filtered}
+        
+        bedtools intersect -v -a {output.filtered} -b {params.blacklist} | \
+            grep -P 'chr[\\dXY]+[ \\t]' > {output.clean} || true
+        
+        sort -k1,1 -k2,2n {output.clean} -o {output.clean}
+        """
+
+
+# =============================================================================
+# DS03: Summit Filtration and Integration
+# =============================================================================
+rule summit_filtration:
+    input:
+        summit = f"{OUTDIR_DS}/02-peaks/{{group}}/{{group}}_summits.bed",
+        peak = f"{OUTDIR_DS}/02-peaks/{{group}}/{{group}}_peaks.narrowPeak.Q0.05.rm_blacklist.bed"
+    output:
+        filtered = f"{OUTDIR_DS}/02-peaks/{{group}}/{{group}}_summits.filtered.bed"
+    params:
+        bandwidth = config.get("summit", {}).get("bandwidth", 250)
+    log:
+        f"{OUTDIR_DS}/logs/ds03-summit_filter_{{group}}.log"
+    shell:
+        """
+        python workflow/scripts/summit_filtration.py \
+            {input.summit} \
+            {input.peak} \
+            {params.bandwidth} 2>&1 | tee {log}
+        """
+
+rule summit_integration:
+    input:
+        summits = expand(f"{OUTDIR_DS}/02-peaks/{{group}}/{{group}}_summits.filtered.bed", group=GROUPS)
+    output:
+        concat = temp(f"{OUTDIR_DS}/02-peaks/concat_summits.bed"),
+        sorted = temp(f"{OUTDIR_DS}/02-peaks/concat_summits.sorted.bed"),
+        merged = f"{OUTDIR_DS}/02-peaks/merged_summits.bed",
+        renamed = f"{OUTDIR_DS}/02-peaks/merged_summits.rename.bed",
+        name_map = f"{OUTDIR_DS}/02-peaks/merged_summits.txt"
+    log:
+        f"{OUTDIR_DS}/logs/ds03-summit_integration.log"
+    shell:
+        """
+        # Concatenate all filtered summits
+        cat {input.summits} > {output.concat}
+        
+        # Sort by chromosome and position
+        sort -k1,1 -k2,2n {output.concat} > {output.sorted}
+        
+        # Merge overlapping summits
+        bedtools merge -d 0 -c 4 -delim "|" -o collapse -i {output.sorted} > {output.merged}
+        
+        # Rename merged summits
+        python workflow/scripts/summit_rename.py {output.merged} 2>&1 | tee {log}
+        """
+
+
+# =============================================================================
+# DS04: Count Table on Merged Peaks
+# =============================================================================
+rule count_table_merged:
+    input:
+        bed = f"{OUTDIR}/07-shift/{{sample}}.shift.bed",
+        peak = f"{OUTDIR_DS}/02-peaks/merged_summits.rename.bed"
+    output:
+        count = f"{OUTDIR_DS}/04-counts/{{sample}}.readcount"
+    params:
+        outdir = f"{OUTDIR_DS}/04-counts"
+    log:
+        f"{OUTDIR_DS}/logs/ds04-counts_{{sample}}.log"
+    shell:
+        """
+        mkdir -p {params.outdir}
+        python workflow/scripts/countTable.py \
+            {input.bed} \
+            {input.peak} \
+            {params.outdir} \
+            {wildcards.sample} 2>&1 | tee {log}
+        """
+
+rule merge_count_tables:
+    input:
+        counts = expand(f"{OUTDIR_DS}/04-counts/{{sample}}.readcount", sample=SAMPLES)
+    output:
+        merged = f"{OUTDIR_DS}/04-counts/counts.tsv"
+    log:
+        f"{OUTDIR_DS}/logs/ds04-counts_merge.log"
+    shell:
+        """
+        python workflow/scripts/count_table_merge.py {OUTDIR_DS}/04-counts 2>&1 | tee {log}
+        """
+
+
+# =============================================================================
+# DS05: Generate Group BigWig Tracks
+# =============================================================================
+rule group_bigwig:
+    input:
+        bed = f"{OUTDIR_DS}/01-merge/{{group}}.bed"
+    output:
+        sorted_bed = temp(f"{OUTDIR_DS}/05-tracks/{{group}}.sort.bed"),
+        bedgraph = temp(f"{OUTDIR_DS}/05-tracks/{{group}}.bedGraph"),
+        norm_bedgraph = temp(f"{OUTDIR_DS}/05-tracks/{{group}}.norm.bedGraph"),
+        bw = f"{OUTDIR_DS}/05-tracks/{{group}}.norm.bw"
+    params:
+        chrom_sizes = config["reference"]["chrom_sizes"]
+    log:
+        f"{OUTDIR_DS}/logs/ds05-tracks_{{group}}.log"
+    shell:
+        """
+        # Sort BED file
+        sort -k1,1V -k2,2n {input.bed} > {output.sorted_bed}
+        
+        # BED -> BedGraph
+        genomeCoverageBed -bg -split -i {output.sorted_bed} -g {params.chrom_sizes} > {output.bedgraph}
+        
+        # Normalize BedGraph
+        python workflow/scripts/normalizebedGraph.py {output.bedgraph} {output.norm_bedgraph}
+        
+        # Sort and convert to BigWig
+        sort -k1,1 -k2,2n {output.norm_bedgraph} -o {output.norm_bedgraph}
+        bedGraphToBigWig {output.norm_bedgraph} {params.chrom_sizes} {output.bw} 2>&1 | tee {log}
+        """
+
+
+# =============================================================================
+# DS06: Merge BAM Files by Group
+# =============================================================================
+rule merge_bam:
+    input:
+        bams = get_group_dedup_bams
+    output:
+        merged = temp(f"{OUTDIR_DS}/06-merge_bam/{{group}}.bam"),
+        sorted = f"{OUTDIR_DS}/06-merge_bam/{{group}}.sort.bam",
+        index = f"{OUTDIR_DS}/06-merge_bam/{{group}}.sort.bam.bai"
+    threads: config["threads"]["samtools_sort"]
+    log:
+        f"{OUTDIR_DS}/logs/ds06-merge_bam_{{group}}.log"
+    shell:
+        """
+        mkdir -p $(dirname {output.merged})
+        
+        # Merge BAM files
+        samtools merge -@ {threads} {output.merged} {input.bams} 2>{log}
+        
+        # Sort merged BAM
+        samtools sort -@ {threads} -o {output.sorted} {output.merged} 2>>{log}
+        
+        # Index sorted BAM
+        samtools index {output.sorted} 2>>{log}
+        """
+
+
+# =============================================================================
+# DS07: Motif Enrichment (HOMER) - Optional
+# =============================================================================
+rule homer_motif:
+    input:
+        bed = f"{OUTDIR_DS}/07-homer/{{analysis}}.bed"
+    output:
+        directory(f"{OUTDIR_DS}/07-homer/{{analysis}}_results")
+    params:
+        genome = config.get("homer", {}).get("genome", "hg38"),
+        size = config.get("homer", {}).get("size", 100),
+        motif_len = config.get("homer", {}).get("motif_len", "5,6,7,8,9,10")
+    threads: config["threads"].get("homer", 4)
+    log:
+        f"{OUTDIR_DS}/logs/ds07-homer_{{analysis}}.log"
+    shell:
+        """
+        findMotifsGenome.pl {input.bed} {params.genome} {output} \
+            -size {params.size} -len {params.motif_len} \
+            -p {threads} 2>&1 | tee {log}
+        """
+
+
+# =============================================================================
+# DS08: DeepTools Visualization - Optional
+# =============================================================================
+rule deeptools_matrix:
+    input:
+        regions = config.get("deeptools", {}).get("regions", []),
+        bigwigs = expand(f"{OUTDIR_DS}/05-tracks/{{group}}.norm.bw", group=GROUPS)
+    output:
+        matrix = f"{OUTDIR_DS}/08-deeptools/matrix.gz"
+    params:
+        upstream = config.get("deeptools", {}).get("upstream", 3000),
+        downstream = config.get("deeptools", {}).get("downstream", 3000)
+    threads: config["threads"].get("deeptools", 10)
+    log:
+        f"{OUTDIR_DS}/logs/ds08-deeptools_matrix.log"
+    shell:
+        """
+        computeMatrix reference-point --referencePoint center \
+            -R {input.regions} \
+            -S {input.bigwigs} \
+            -a {params.downstream} -b {params.upstream} \
+            --missingDataAsZero \
+            --skipZeros -p {threads} \
+            -o {output.matrix} 2>&1 | tee {log}
+        """
+
+rule deeptools_heatmap:
+    input:
+        matrix = f"{OUTDIR_DS}/08-deeptools/matrix.gz"
+    output:
+        heatmap = f"{OUTDIR_DS}/08-deeptools/heatmap.pdf"
+    params:
+        color = config.get("deeptools", {}).get("color", "white,#0066CC"),
+        height = config.get("deeptools", {}).get("height", 12),
+        width = config.get("deeptools", {}).get("width", 6)
+    log:
+        f"{OUTDIR_DS}/logs/ds08-deeptools_heatmap.log"
+    shell:
+        """
+        plotHeatmap -m {input.matrix} \
+            --colorList '{params.color}' \
+            --heatmapHeight {params.height} --heatmapWidth {params.width} \
+            --dpi 600 \
+            -o {output.heatmap} 2>&1 | tee {log}
+        """
+
+
+# =============================================================================
+# DS09: TF Footprinting (RGT-HINT) - Optional
+# =============================================================================
+rule rgt_footprinting:
+    input:
+        bam = f"{OUTDIR_DS}/06-merge_bam/{{group}}.sort.bam",
+        bai = f"{OUTDIR_DS}/06-merge_bam/{{group}}.sort.bam.bai",
+        peak = f"{OUTDIR_DS}/02-peaks/{{group}}/{{group}}_peaks.narrowPeak.Q0.05.rm_blacklist.bed"
+    output:
+        footprint = f"{OUTDIR_DS}/09-footprint/{{group}}.bed"
+    params:
+        outdir = f"{OUTDIR_DS}/09-footprint",
+        organism = config.get("rgt", {}).get("organism", "hg38")
+    log:
+        f"{OUTDIR_DS}/logs/ds09-footprint_{{group}}.log"
+    shell:
+        """
+        rgt-hint footprinting --atac-seq --paired-end \
+            --organism={params.organism} \
+            --output-location {params.outdir} \
+            --output-prefix {wildcards.group} \
+            {input.bam} {input.peak} 2>&1 | tee {log}
+        """
+
+rule rgt_motif_matching:
+    input:
+        footprints = expand(f"{OUTDIR_DS}/09-footprint/{{group}}.bed", group=GROUPS)
+    output:
+        mpbs = expand(f"{OUTDIR_DS}/09-footprint/{{group}}_mpbs.bed", group=GROUPS)
+    params:
+        outdir = f"{OUTDIR_DS}/09-footprint",
+        organism = config.get("rgt", {}).get("organism", "hg38")
+    log:
+        f"{OUTDIR_DS}/logs/ds09-motif_matching.log"
+    shell:
+        """
+        rgt-motifanalysis matching --organism={params.organism} \
+            --input-files {input.footprints} \
+            --output-location {params.outdir} 2>&1 | tee {log}
+        """
+
+
+# =============================================================================
+# Utility Rules
+# =============================================================================
+rule clean:
+    shell:
+        """
+        rm -rf {OUTDIR} {OUTDIR_DS}
+        """
+
+rule clean_downstream:
+    shell:
+        """
+        rm -rf {OUTDIR_DS}
+        """
