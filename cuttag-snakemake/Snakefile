@@ -1,0 +1,656 @@
+"""
+CUT&Tag Data Processing and Analysis Pipeline
+Based on: https://yezhengstat.github.io/CUTTag_tutorial/
+Authors: Ye Zheng, Kami Ahmad, Steven Henikoff
+Snakemake implementation
+
+This workflow processes CUT&Tag data from raw FASTQ files through:
+- Quality control (FastQC)
+- Alignment (Bowtie2)
+- Spike-in calibration (E. coli)
+- Duplicate marking/removal (Picard)
+- Fragment size analysis
+- Replicate reproducibility analysis
+- Peak calling (SEACR, MACS2 optional)
+- Peak QC and FRiP calculation
+- Visualization (deepTools)
+- Differential analysis (DESeq2)
+"""
+
+import pandas as pd
+from snakemake.utils import validate, min_version
+
+# Minimum Snakemake version
+min_version("6.0")
+
+# Load configuration
+configfile: "config/config.yaml"
+
+# Load sample information
+samples_df = pd.read_csv(config["samples"], sep="\t")
+SAMPLES = samples_df["sample"].tolist()
+HISTONES = samples_df["histone"].unique().tolist()
+
+# Define control samples (IgG)
+CONTROLS = samples_df[samples_df["histone"] == "IgG"]["sample"].tolist()
+# Define target samples (non-IgG)
+TARGETS = samples_df[samples_df["histone"] != "IgG"]["sample"].tolist()
+# Define histone types (excluding IgG)
+TARGET_HISTONES = [h for h in HISTONES if h != "IgG"]
+
+# Create sample to histone mapping
+SAMPLE_TO_HISTONE = dict(zip(samples_df["sample"], samples_df["histone"]))
+# Create sample to control mapping
+SAMPLE_TO_CONTROL = dict(zip(samples_df["sample"], samples_df["control"]))
+# Create sample to replicate mapping
+SAMPLE_TO_REP = dict(zip(samples_df["sample"], samples_df["replicate"]))
+# Bin length for downstream reproducibility analysis
+BIN_LEN = config["binLen"]
+
+# ============================================================================
+# Target rules
+# ============================================================================
+
+rule all:
+    input:
+        # FastQC reports
+        expand("results/fastqc/{sample}_R1_fastqc.html", sample=SAMPLES),
+        expand("results/fastqc/{sample}_R2_fastqc.html", sample=SAMPLES),
+        # Alignment summaries
+        expand("results/alignment/sam/bowtie2_summary/{sample}_bowtie2.txt", sample=SAMPLES),
+        # Spike-in alignment (if enabled)
+        expand("results/alignment/sam/bowtie2_summary/{sample}_bowtie2_spikeIn.txt", sample=SAMPLES) if config["spikein"]["enabled"] else [],
+        # BAM files
+        expand("results/alignment/bam/{sample}_bowtie2.mapped.bam", sample=SAMPLES),
+        # Fragment bed files
+        expand("results/alignment/bed/{sample}_bowtie2.fragments.bed", sample=SAMPLES),
+        # Fragment length distribution
+        expand("results/alignment/sam/fragmentLen/{sample}_fragmentLen.txt", sample=SAMPLES),
+        # Duplicate metrics
+        expand("results/alignment/removeDuplicate/picard_summary/{sample}_picard.dupMark.txt", sample=SAMPLES),
+        # Normalized bedgraph (if spike-in enabled)
+        expand("results/alignment/bedgraph/{sample}_bowtie2.fragments.normalized.bedgraph", sample=SAMPLES) if config["spikein"]["enabled"] else [],
+        # SEACR peaks
+        expand("results/peakCalling/SEACR/{sample}_seacr_control.peaks.stringent.bed", sample=TARGETS),
+        expand("results/peakCalling/SEACR/{sample}_seacr_top0.01.peaks.stringent.bed", sample=TARGETS),
+        # BigWig files
+        expand("results/alignment/bigwig/{sample}_raw.bw", sample=SAMPLES),
+        # Bin count for reproducibility
+        expand("results/alignment/bed/{sample}_bowtie2.fragmentsCount.bin{binLen}.bed", sample=SAMPLES, binLen=BIN_LEN),
+        # QC summary report
+        "results/qc/alignment_summary.tsv",
+        "results/qc/alignment_qc_plots.pdf",
+        "results/qc/fragment_length_summary.pdf",
+        "results/qc/replicate_correlation.pdf",
+        "results/qc/peak/peak_qc_peak_summary.tsv",
+        "results/qc/peak/peak_qc_reproducibility.tsv",
+        "results/qc/peak/peak_qc_frip.tsv",
+        "results/qc/peak/peak_qc.pdf",
+        # Heatmaps
+        "results/visualization/Histone_gene_heatmap.png" if config["visualization"]["gene_heatmap"] else [],
+
+
+# ============================================================================
+# Rule: FastQC Quality Control
+# ============================================================================
+
+rule fastqc:
+    input:
+        r1 = lambda wildcards: config["fastq_dir"] + "/" + wildcards.sample + "_R1.fastq.gz",
+        r2 = lambda wildcards: config["fastq_dir"] + "/" + wildcards.sample + "_R2.fastq.gz"
+    output:
+        html_r1 = "results/fastqc/{sample}_R1_fastqc.html",
+        zip_r1 = "results/fastqc/{sample}_R1_fastqc.zip",
+        html_r2 = "results/fastqc/{sample}_R2_fastqc.html",
+        zip_r2 = "results/fastqc/{sample}_R2_fastqc.zip"
+    params:
+        outdir = "results/fastqc"
+    threads: 2
+    log:
+        "logs/fastqc/{sample}.log"
+    shell:
+        """
+        fastqc -o {params.outdir} -t {threads} {input.r1} {input.r2} 2> {log}
+        # Rename output files to match expected names
+        mv {params.outdir}/$(basename {input.r1} .fastq.gz)_fastqc.html {output.html_r1}
+        mv {params.outdir}/$(basename {input.r1} .fastq.gz)_fastqc.zip {output.zip_r1}
+        mv {params.outdir}/$(basename {input.r2} .fastq.gz)_fastqc.html {output.html_r2}
+        mv {params.outdir}/$(basename {input.r2} .fastq.gz)_fastqc.zip {output.zip_r2}
+        """
+
+
+# ============================================================================
+# Rule: Bowtie2 Alignment to Reference Genome (hg38)
+# ============================================================================
+
+rule bowtie2_align:
+    input:
+        r1 = lambda wildcards: config["fastq_dir"] + "/" + wildcards.sample + "_R1.fastq.gz",
+        r2 = lambda wildcards: config["fastq_dir"] + "/" + wildcards.sample + "_R2.fastq.gz"
+    output:
+        sam = temp("results/alignment/sam/{sample}_bowtie2.sam"),
+        summary = "results/alignment/sam/bowtie2_summary/{sample}_bowtie2.txt"
+    params:
+        ref = config["bowtie2_index"],
+        # CUT&Tag specific parameters
+        extra = "--end-to-end --very-sensitive --no-mixed --no-discordant --phred33 -I 10 -X 700"
+    threads: config["threads"]
+    log:
+        "logs/bowtie2/{sample}.log"
+    shell:
+        """
+        bowtie2 {params.extra} \
+            -p {threads} \
+            -x {params.ref} \
+            -1 {input.r1} \
+            -2 {input.r2} \
+            -S {output.sam} \
+            2> {output.summary}
+        """
+
+
+# ============================================================================
+# Rule: Bowtie2 Alignment to Spike-in Genome (E. coli)
+# ============================================================================
+
+rule bowtie2_align_spikein:
+    input:
+        r1 = lambda wildcards: config["fastq_dir"] + "/" + wildcards.sample + "_R1.fastq.gz",
+        r2 = lambda wildcards: config["fastq_dir"] + "/" + wildcards.sample + "_R2.fastq.gz"
+    output:
+        sam = temp("results/alignment/sam/{sample}_bowtie2_spikeIn.sam"),
+        summary = "results/alignment/sam/bowtie2_summary/{sample}_bowtie2_spikeIn.txt",
+        seqdepth = "results/alignment/sam/bowtie2_summary/{sample}_bowtie2_spikeIn.seqDepth"
+    params:
+        ref = config["spikein"]["bowtie2_index"],
+        # Additional parameters for spike-in: --no-overlap --no-dovetail
+        extra = "--end-to-end --very-sensitive --no-overlap --no-dovetail --no-mixed --no-discordant --phred33 -I 10 -X 700"
+    threads: config["threads"]
+    log:
+        "logs/bowtie2_spikein/{sample}.log"
+    shell:
+        """
+        bowtie2 {params.extra} \
+            -p {threads} \
+            -x {params.ref} \
+            -1 {input.r1} \
+            -2 {input.r2} \
+            -S {output.sam} \
+            2> {output.summary}
+        
+        # Calculate spike-in sequencing depth
+        seqDepthDouble=$(samtools view -F 0x04 {output.sam} | wc -l)
+        seqDepth=$((seqDepthDouble/2))
+        echo $seqDepth > {output.seqdepth}
+        """
+
+
+# ============================================================================
+# Rule: Sort SAM by coordinate (for Picard)
+# ============================================================================
+
+rule sort_sam:
+    input:
+        sam = "results/alignment/sam/{sample}_bowtie2.sam"
+    output:
+        sorted_sam = temp("results/alignment/sam/{sample}_bowtie2.sorted.sam")
+    log:
+        "logs/picard_sort/{sample}.log"
+    shell:
+        """
+        picard SortSam \
+            I={input.sam} \
+            O={output.sorted_sam} \
+            SORT_ORDER=coordinate \
+            2> {log}
+        """
+
+
+# ============================================================================
+# Rule: Mark Duplicates with Picard
+# ============================================================================
+
+rule mark_duplicates:
+    input:
+        sorted_sam = "results/alignment/sam/{sample}_bowtie2.sorted.sam"
+    output:
+        marked_sam = temp("results/alignment/removeDuplicate/{sample}_bowtie2.sorted.dupMarked.sam"),
+        metrics = "results/alignment/removeDuplicate/picard_summary/{sample}_picard.dupMark.txt"
+    log:
+        "logs/picard_markdup/{sample}.log"
+    shell:
+        """
+        picard MarkDuplicates \
+            I={input.sorted_sam} \
+            O={output.marked_sam} \
+            METRICS_FILE={output.metrics} \
+            2> {log}
+        """
+
+
+# ============================================================================
+# Rule: Remove Duplicates (optional - creates separate file)
+# ============================================================================
+
+rule remove_duplicates:
+    input:
+        sorted_sam = "results/alignment/sam/{sample}_bowtie2.sorted.sam"
+    output:
+        rmdup_sam = temp("results/alignment/removeDuplicate/{sample}_bowtie2.sorted.rmDup.sam"),
+        metrics = "results/alignment/removeDuplicate/picard_summary/{sample}_picard.rmDup.txt"
+    log:
+        "logs/picard_rmdup/{sample}.log"
+    shell:
+        """
+        picard MarkDuplicates \
+            I={input.sorted_sam} \
+            O={output.rmdup_sam} \
+            REMOVE_DUPLICATES=true \
+            METRICS_FILE={output.metrics} \
+            2> {log}
+        """
+
+
+# ============================================================================
+# Rule: Filter and convert SAM to BAM
+# ============================================================================
+
+rule sam_to_bam:
+    input:
+        sam = "results/alignment/sam/{sample}_bowtie2.sam"
+    output:
+        bam = "results/alignment/bam/{sample}_bowtie2.mapped.bam"
+    params:
+        # Filter unmapped reads
+        flags = "-F 0x04",
+        mapq = config["min_mapping_quality"]
+    log:
+        "logs/samtools/{sample}_sam2bam.log"
+    shell:
+        """
+        if [ {params.mapq} -gt 0 ]; then
+            samtools view -bS {params.flags} -q {params.mapq} {input.sam} > {output.bam} 2> {log}
+        else
+            samtools view -bS {params.flags} {input.sam} > {output.bam} 2> {log}
+        fi
+        """
+
+
+# ============================================================================
+# Rule: Convert BAM to BED (paired-end)
+# ============================================================================
+
+rule bam_to_bed:
+    input:
+        bam = "results/alignment/bam/{sample}_bowtie2.mapped.bam"
+    output:
+        bed = temp("results/alignment/bed/{sample}_bowtie2.bed")
+    log:
+        "logs/bedtools/{sample}_bam2bed.log"
+    shell:
+        """
+        bedtools bamtobed -i {input.bam} -bedpe > {output.bed} 2> {log}
+        """
+
+
+# ============================================================================
+# Rule: Clean BED file (same chromosome, fragment < 1000bp)
+# ============================================================================
+
+rule clean_bed:
+    input:
+        bed = "results/alignment/bed/{sample}_bowtie2.bed"
+    output:
+        clean_bed = temp("results/alignment/bed/{sample}_bowtie2.clean.bed")
+    shell:
+        """
+        awk '$1==$4 && $6-$2 < 1000 {{print $0}}' {input.bed} > {output.clean_bed}
+        """
+
+
+# ============================================================================
+# Rule: Extract fragment coordinates
+# ============================================================================
+
+rule extract_fragments:
+    input:
+        clean_bed = "results/alignment/bed/{sample}_bowtie2.clean.bed"
+    output:
+        fragments = "results/alignment/bed/{sample}_bowtie2.fragments.bed"
+    shell:
+        """
+        cut -f 1,2,6 {input.clean_bed} | sort -k1,1 -k2,2n -k3,3n > {output.fragments}
+        """
+
+
+# ============================================================================
+# Rule: Calculate fragment length distribution
+# ============================================================================
+
+rule fragment_length:
+    input:
+        sam = "results/alignment/sam/{sample}_bowtie2.sam"
+    output:
+        fraglen = "results/alignment/sam/fragmentLen/{sample}_fragmentLen.txt"
+    shell:
+        """
+        samtools view -F 0x04 {input.sam} | \
+            awk -F'\\t' 'function abs(x){{return ((x < 0.0) ? -x : x)}} {{print abs($9)}}' | \
+            sort | uniq -c | \
+            awk -v OFS="\\t" '{{print $2, $1/2}}' > {output.fraglen}
+        """
+
+
+# ============================================================================
+# Rule: Bin fragment counts for reproducibility analysis
+# ============================================================================
+
+rule bin_fragment_counts:
+    input:
+        fragments = "results/alignment/bed/{sample}_bowtie2.fragments.bed"
+    output:
+        bin_counts = "results/alignment/bed/{sample}_bowtie2.fragmentsCount.bin{binLen}.bed"
+    params:
+        binLen = lambda wildcards: wildcards.binLen
+    shell:
+        """
+        awk -v w={params.binLen} '{{print $1, int(($2 + $3)/(2*w))*w + w/2}}' {input.fragments} | \
+            sort -k1,1V -k2,2n | uniq -c | \
+            awk -v OFS="\\t" '{{print $2, $3, $1}}' | \
+            sort -k1,1V -k2,2n > {output.bin_counts}
+        """
+
+
+# ============================================================================
+# Rule: Generate normalized bedgraph with spike-in calibration
+# ============================================================================
+
+rule normalize_bedgraph:
+    input:
+        fragments = "results/alignment/bed/{sample}_bowtie2.fragments.bed",
+        seqdepth = "results/alignment/sam/bowtie2_summary/{sample}_bowtie2_spikeIn.seqDepth"
+    output:
+        bedgraph = "results/alignment/bedgraph/{sample}_bowtie2.fragments.normalized.bedgraph"
+    params:
+        chromSize = config["chrom_sizes"],
+        multiplier = config["spikein"]["multiplier"]
+    log:
+        "logs/normalize/{sample}.log"
+    shell:
+        """
+        seqDepth=$(cat {input.seqdepth})
+        if [ "$seqDepth" -gt "1" ]; then
+            scale_factor=$(echo "{params.multiplier} / $seqDepth" | bc -l)
+            echo "Scaling factor for {wildcards.sample} is: $scale_factor" > {log}
+            bedtools genomecov -bg -scale $scale_factor \
+                -i {input.fragments} \
+                -g {params.chromSize} > {output.bedgraph}
+        else
+            echo "Spike-in depth too low for {wildcards.sample}" > {log}
+            touch {output.bedgraph}
+        fi
+        """
+
+
+# ============================================================================
+# Rule: Generate bedgraph without spike-in normalization
+# ============================================================================
+
+rule bedgraph_no_spikein:
+    input:
+        fragments = "results/alignment/bed/{sample}_bowtie2.fragments.bed"
+    output:
+        bedgraph = "results/alignment/bedgraph/{sample}_bowtie2.fragments.bedgraph"
+    params:
+        chromSize = config["chrom_sizes"]
+    shell:
+        """
+        bedtools genomecov -bg -i {input.fragments} -g {params.chromSize} > {output.bedgraph}
+        """
+
+
+# ============================================================================
+# Rule: SEACR Peak Calling with control
+# ============================================================================
+
+rule seacr_control:
+    input:
+        target = lambda wildcards: "results/alignment/bedgraph/{sample}_bowtie2.fragments.normalized.bedgraph".format(sample=wildcards.sample) if config["spikein"]["enabled"] else "results/alignment/bedgraph/{sample}_bowtie2.fragments.bedgraph".format(sample=wildcards.sample),
+        control = lambda wildcards: "results/alignment/bedgraph/{control}_bowtie2.fragments.normalized.bedgraph".format(control=SAMPLE_TO_CONTROL[wildcards.sample]) if config["spikein"]["enabled"] else "results/alignment/bedgraph/{control}_bowtie2.fragments.bedgraph".format(control=SAMPLE_TO_CONTROL[wildcards.sample])
+    output:
+        peaks = "results/peakCalling/SEACR/{sample}_seacr_control.peaks.stringent.bed"
+    params:
+        seacr = config["seacr_path"],
+        norm = "non" if config["spikein"]["enabled"] else "norm",
+        prefix = "results/peakCalling/SEACR/{sample}_seacr_control.peaks"
+    log:
+        "logs/seacr/{sample}_control.log"
+    shell:
+        """
+        bash {params.seacr} {input.target} {input.control} {params.norm} stringent {params.prefix} 2> {log}
+        """
+
+
+# ============================================================================
+# Rule: SEACR Peak Calling with top percentage threshold
+# ============================================================================
+
+rule seacr_top:
+    input:
+        target = lambda wildcards: "results/alignment/bedgraph/{sample}_bowtie2.fragments.normalized.bedgraph".format(sample=wildcards.sample) if config["spikein"]["enabled"] else "results/alignment/bedgraph/{sample}_bowtie2.fragments.bedgraph".format(sample=wildcards.sample)
+    output:
+        peaks = "results/peakCalling/SEACR/{sample}_seacr_top0.01.peaks.stringent.bed"
+    params:
+        seacr = config["seacr_path"],
+        threshold = config["seacr_threshold"],
+        norm = "non" if config["spikein"]["enabled"] else "norm",
+        prefix = "results/peakCalling/SEACR/{sample}_seacr_top0.01.peaks"
+    log:
+        "logs/seacr/{sample}_top.log"
+    shell:
+        """
+        bash {params.seacr} {input.target} {params.threshold} {params.norm} stringent {params.prefix} 2> {log}
+        """
+
+
+# ============================================================================
+# Rule: Sort BAM and create index for visualization
+# ============================================================================
+
+rule sort_bam:
+    input:
+        bam = "results/alignment/bam/{sample}_bowtie2.mapped.bam"
+    output:
+        sorted_bam = "results/alignment/bam/{sample}.sorted.bam",
+        bai = "results/alignment/bam/{sample}.sorted.bam.bai"
+    threads: 4
+    log:
+        "logs/samtools/{sample}_sort.log"
+    shell:
+        """
+        samtools sort -@ {threads} -o {output.sorted_bam} {input.bam} 2> {log}
+        samtools index {output.sorted_bam}
+        """
+
+
+# ============================================================================
+# Rule: Generate BigWig files for visualization
+# ============================================================================
+
+rule bam_to_bigwig:
+    input:
+        bam = "results/alignment/bam/{sample}.sorted.bam",
+        bai = "results/alignment/bam/{sample}.sorted.bam.bai"
+    output:
+        bw = "results/alignment/bigwig/{sample}_raw.bw"
+    threads: 4
+    log:
+        "logs/deeptools/{sample}_bamcoverage.log"
+    shell:
+        """
+        bamCoverage -b {input.bam} -o {output.bw} -p {threads} 2> {log}
+        """
+
+
+# ============================================================================
+# Rule: Generate heatmap over gene regions
+# ============================================================================
+
+rule compute_matrix_genes:
+    input:
+        bw = expand("results/alignment/bigwig/{sample}_raw.bw", sample=TARGETS)
+    output:
+        matrix = "results/visualization/matrix_gene.mat.gz"
+    params:
+        gene_bed = config["gene_bed"],
+        before = config["visualization"]["before_region"],
+        body = config["visualization"]["body_length"],
+        after = config["visualization"]["after_region"]
+    threads: config["threads"]
+    log:
+        "logs/deeptools/compute_matrix_genes.log"
+    shell:
+        """
+        computeMatrix scale-regions \
+            -S {input.bw} \
+            -R {params.gene_bed} \
+            --beforeRegionStartLength {params.before} \
+            --regionBodyLength {params.body} \
+            --afterRegionStartLength {params.after} \
+            --skipZeros \
+            -o {output.matrix} \
+            -p {threads} \
+            2> {log}
+        """
+
+
+rule plot_heatmap_genes:
+    input:
+        matrix = "results/visualization/matrix_gene.mat.gz"
+    output:
+        heatmap = "results/visualization/Histone_gene_heatmap.png"
+    log:
+        "logs/deeptools/plot_heatmap_genes.log"
+    shell:
+        """
+        plotHeatmap -m {input.matrix} \
+            -out {output.heatmap} \
+            --sortUsing sum \
+            2> {log}
+        """
+
+
+# ============================================================================
+# Rule: Extract SEACR peak summit regions for heatmap
+# ============================================================================
+
+rule extract_peak_summits:
+    input:
+        peaks = "results/peakCalling/SEACR/{sample}_seacr_control.peaks.stringent.bed"
+    output:
+        summits = "results/peakCalling/SEACR/{sample}_seacr_control.peaks.summitRegion.bed"
+    shell:
+        """
+        awk '{{split($6, summit, ":"); split(summit[2], region, "-"); print summit[1]"\\t"region[1]"\\t"region[2]}}' \
+            {input.peaks} > {output.summits}
+        """
+
+
+# ============================================================================
+# Rule: Generate QC summary report
+# ============================================================================
+
+rule qc_summary:
+    input:
+        align_summaries = expand("results/alignment/sam/bowtie2_summary/{sample}_bowtie2.txt", sample=SAMPLES),
+        spikein_summaries = expand("results/alignment/sam/bowtie2_summary/{sample}_bowtie2_spikeIn.txt", sample=SAMPLES) if config["spikein"]["enabled"] else [],
+        dup_metrics = expand("results/alignment/removeDuplicate/picard_summary/{sample}_picard.dupMark.txt", sample=SAMPLES),
+        fraglen = expand("results/alignment/sam/fragmentLen/{sample}_fragmentLen.txt", sample=SAMPLES)
+    output:
+        summary = "results/qc/alignment_summary.tsv"
+    params:
+        samples = SAMPLES,
+        histones = [SAMPLE_TO_HISTONE[s] for s in SAMPLES],
+        spikein_enabled = config["spikein"]["enabled"]
+    script:
+        "workflow/scripts/qc_summary.py"
+
+
+# ============================================================================
+# Rule: Plot fragment length distribution
+# ============================================================================
+
+rule plot_fragment_length:
+    input:
+        fraglen = expand("results/alignment/sam/fragmentLen/{sample}_fragmentLen.txt", sample=SAMPLES)
+    output:
+        pdf = "results/qc/fragment_length_summary.pdf"
+    params:
+        samples = SAMPLES,
+        histones = [SAMPLE_TO_HISTONE[s] for s in SAMPLES]
+    script:
+        "workflow/scripts/plot_fragment_length.R"
+
+
+# ============================================================================
+# Rule: Alignment QC plots
+# ============================================================================
+
+rule alignment_qc_plots:
+    input:
+        summary = "results/qc/alignment_summary.tsv"
+    output:
+        pdf = "results/qc/alignment_qc_plots.pdf"
+    script:
+        "workflow/scripts/alignment_qc_plots.R"
+
+
+# ============================================================================
+# Rule: Replicate correlation heatmap
+# ============================================================================
+
+rule replicate_correlation:
+    input:
+        bin_counts = expand("results/alignment/bed/{sample}_bowtie2.fragmentsCount.bin{binLen}.bed", sample=SAMPLES, binLen=BIN_LEN)
+    output:
+        pdf = "results/qc/replicate_correlation.pdf"
+    params:
+        samples = SAMPLES
+    script:
+        "workflow/scripts/replicate_correlation.R"
+
+
+# ============================================================================
+# Rule: Peak QC and FRiP calculation
+# ============================================================================
+
+rule peak_qc:
+    input:
+        peaks_control = expand("results/peakCalling/SEACR/{sample}_seacr_control.peaks.stringent.bed", sample=TARGETS),
+        peaks_top = expand("results/peakCalling/SEACR/{sample}_seacr_top0.01.peaks.stringent.bed", sample=TARGETS),
+        bams = expand("results/alignment/bam/{sample}_bowtie2.mapped.bam", sample=TARGETS)
+    output:
+        peak_summary = "results/qc/peak/peak_qc_peak_summary.tsv",
+        reproducibility = "results/qc/peak/peak_qc_reproducibility.tsv",
+        frip = "results/qc/peak/peak_qc_frip.tsv",
+        pdf = "results/qc/peak/peak_qc.pdf"
+    params:
+        peak_dir = "results/peakCalling/SEACR",
+        bam_dir = "results/alignment/bam",
+        samples = ",".join(SAMPLES),
+        histones = ",".join([SAMPLE_TO_HISTONE[s] for s in SAMPLES]),
+        prefix = "results/qc/peak/peak_qc"
+    log:
+        "logs/peak_qc/peak_qc.log"
+    shell:
+        """
+        mkdir -p $(dirname {output.pdf})
+        mkdir -p $(dirname {log})
+        Rscript workflow/scripts/peak_qc.R \
+            {params.peak_dir} \
+            {params.bam_dir} \
+            "{params.samples}" \
+            "{params.histones}" \
+            {params.prefix} \
+            > {log} 2>&1
+        """

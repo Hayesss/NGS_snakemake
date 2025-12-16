@@ -1,0 +1,98 @@
+# =============================================================================
+# CUT&Tag Snakemake Pipeline Configuration
+# Based on: https://yezhengstat.github.io/CUTTag_tutorial/
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Sample Information
+# -----------------------------------------------------------------------------
+# Path to samples.tsv file containing sample metadata
+samples: "config/samples.tsv"
+
+# -----------------------------------------------------------------------------
+# Input Data
+# -----------------------------------------------------------------------------
+# Directory containing FASTQ files
+# Files should be named: {sample}_R1.fastq.gz and {sample}_R2.fastq.gz
+fastq_dir: "data/fastq"
+
+# -----------------------------------------------------------------------------
+# Reference Genome
+# -----------------------------------------------------------------------------
+# Path to Bowtie2 index for reference genome (e.g., hg38)
+# Build with: bowtie2-build /path/to/hg38.fa /path/to/bowtie2Index/hg38
+bowtie2_index: "/path/to/bowtie2Index/hg38"
+
+# Chromosome sizes file for reference genome
+# Download from UCSC or generate with: samtools faidx genome.fa && cut -f1,2 genome.fa.fai > genome.chrom.sizes
+chrom_sizes: "/path/to/hg38.chrom.sizes"
+
+# Gene annotation file (BED or TSV format) for heatmap visualization
+# Can be downloaded from UCSC Table Browser or Ensembl
+gene_bed: "/path/to/hg38_genes.bed"
+
+# -----------------------------------------------------------------------------
+# Spike-in Calibration (E. coli)
+# -----------------------------------------------------------------------------
+spikein:
+  # Enable/disable spike-in normalization
+  enabled: true
+  # Path to Bowtie2 index for E. coli spike-in genome (U00096.3)
+  # Build with: bowtie2-build /path/to/Ecoli.fa /path/to/bowtie2Index/Ecoli
+  bowtie2_index: "/path/to/bowtie2Index/Ecoli"
+  # Multiplier for spike-in normalization (typically 10000)
+  multiplier: 10000
+
+# -----------------------------------------------------------------------------
+# Peak Calling (SEACR)
+# -----------------------------------------------------------------------------
+# Path to SEACR script
+# Download from: https://github.com/FredHutch/SEACR
+seacr_path: "/path/to/SEACR/SEACR_1.3.sh"
+
+# SEACR threshold for top percentage peak calling (without control)
+# 0.01 means top 1% of peaks
+seacr_threshold: 0.01
+
+# -----------------------------------------------------------------------------
+# Analysis Parameters
+# -----------------------------------------------------------------------------
+# Number of threads for parallel processing
+threads: 8
+
+# Bin size for reproducibility analysis (bp)
+binLen: 500
+
+# Minimum mapping quality score (optional filtering)
+# Set to 0 to disable filtering
+min_mapping_quality: 2
+
+# -----------------------------------------------------------------------------
+# Visualization Parameters
+# -----------------------------------------------------------------------------
+visualization:
+  # Whether to generate gene heatmap
+  gene_heatmap: true
+  # Region parameters for computeMatrix (bp)
+  before_region: 3000
+  body_length: 5000
+  after_region: 3000
+
+# -----------------------------------------------------------------------------
+# Optional: Duplicate Removal
+# -----------------------------------------------------------------------------
+# Whether to remove duplicates (not recommended for CUT&Tag)
+# Set to true only if PCR duplication is suspected
+remove_duplicates: false
+
+# -----------------------------------------------------------------------------
+# Output Directories (relative to workflow directory)
+# -----------------------------------------------------------------------------
+# These are automatically created by the pipeline
+output_dirs:
+  fastqc: "results/fastqc"
+  alignment: "results/alignment"
+  peaks: "results/peakCalling"
+  visualization: "results/visualization"
+  qc: "results/qc"
+  logs: "logs"

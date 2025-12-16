@@ -1,0 +1,47 @@
+# Conda environment for CUT&Tag Snakemake pipeline
+# Based on: https://yezhengstat.github.io/CUTTag_tutorial/
+
+name: cuttag
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+
+dependencies:
+  # Core pipeline tools
+  - python>=3.8
+  - snakemake>=6.0
+  - pandas
+  
+  # Quality Control
+  - fastqc>=0.11.9
+  
+  # Alignment
+  - bowtie2>=2.3.4
+  - samtools>=1.10
+  
+  # BAM/BED processing
+  - bedtools>=2.29.1
+  - picard>=2.18.29
+  
+  # Visualization
+  - deeptools>=2.0
+  
+  # R and dependencies
+  - r-base>=4.0
+  - r-dplyr
+  - r-stringr
+  - r-ggplot2
+  - r-viridis
+  - r-ggpubr
+  - r-corrplot
+  
+  # Bioconductor packages
+  - bioconductor-genomicranges
+  - bioconductor-chromvar
+  - bioconductor-deseq2
+  
+  # Additional utilities
+  - bc
+  - wget
+  - git

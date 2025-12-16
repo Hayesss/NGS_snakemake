@@ -1,0 +1,7 @@
+sample	histone	replicate	control
+K27me3_rep1	K27me3	rep1	IgG_rep1
+K27me3_rep2	K27me3	rep2	IgG_rep2
+K4me3_rep1	K4me3	rep1	IgG_rep1
+K4me3_rep2	K4me3	rep2	IgG_rep2
+IgG_rep1	IgG	rep1	IgG_rep1
+IgG_rep2	IgG	rep2	IgG_rep2
