@@ -1,0 +1,25 @@
+out_dir: "v2_results"
+
+star_index: "/home//data/public_data/human_reference/STAR_index"
+gtf: "/home//data/public_data/human_reference/gencode.v41.annotation.gtf"
+fastp_threads: 8
+star_threads: 20
+
+resources:
+  limit_dump: 2
+  limit_merge: 2
+  bam_coverage:
+    bin_size: 50
+    genome_size: 2913022398
+    normalize_using: BPM
+
+projects:
+  SRP310170:
+    metadata: "SRP310170_metadata.tsv"
+    data_dir: "/home/data/public_data/pysradb_downloads/SRP310170"
+  SRP274341:
+    metadata: "SRP274341_metadata.tsv"
+    data_dir: "/home/data/public_data/pysradb_downloads/SRP274341"
+  SRP335821:
+    metadata: "SRP335821_metadata.tsv"
+    data_dir: "/home/data/public_data/pysradb_downloads/SRP335821"

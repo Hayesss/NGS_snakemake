@@ -1,0 +1,15 @@
+# environment.yaml
+name: rna_seq
+channels:
+  - conda-forge
+  - bioconda
+  - nodefaults
+dependencies:
+  - star= 2.7.10b
+  - samtools=1.9
+  - fastp=0.22.0
+  - deeptools
+custom_channels:
+  conda-forge: https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud
+  bioconda: https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud
+channel_priority: strict

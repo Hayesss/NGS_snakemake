@@ -1,0 +1,352 @@
+import os
+import pandas as pd
+
+# 新流程配置
+configfile: "config_v2.yaml"
+
+OUT_DIR = config.get("out_dir", "v2_results")
+PROJECTS = config["projects"]
+FASTP_THREADS = config.get("fastp_threads", 8)
+STAR_THREADS = config.get("star_threads", 8)
+RESOURCES_CFG = config.get("resources", {})
+LIMIT_DUMP = RESOURCES_CFG.get("limit_dump", 1)
+LIMIT_MERGE = RESOURCES_CFG.get("limit_merge", 1)
+BAMCOV_CFG = RESOURCES_CFG.get("bam_coverage", {})
+
+_METADATA_CACHE = {}
+
+
+def metadata_df(project):
+    """Cache metadata per project."""
+    if project not in _METADATA_CACHE:
+        metadata_path = PROJECTS[project]["metadata"]
+        _METADATA_CACHE[project] = pd.read_csv(metadata_path, sep="\t")
+    return _METADATA_CACHE[project]
+
+
+def experiment_ids(project):
+    return metadata_df(project)["experiment_accession"].unique().tolist()
+
+
+def runs_for_sample(project, sample):
+    df = metadata_df(project)
+    return df.loc[df["experiment_accession"] == sample, "run_accession"].tolist()
+
+
+def is_paired(project, sample):
+    df = metadata_df(project)
+    layout = df.loc[df["experiment_accession"] == sample, "library_layout"].unique().tolist()
+    return len(layout) == 1 and layout[0].upper() == "PAIRED"
+
+
+def sra_path(project, sra):
+    df = metadata_df(project)
+    srx_id = df.loc[df["run_accession"] == sra, "experiment_accession"].tolist()[0]
+    data_dir = PROJECTS[project]["data_dir"]
+    return os.path.join(data_dir, f"{srx_id}/{sra}.sra")
+
+
+def count_file(project, sample):
+    return os.path.join(OUT_DIR, project, "02_read_align", f"{sample}_ReadsPerGene.out.tab")
+
+
+def count_files_for_project(project):
+    return [count_file(project, sample) for sample in experiment_ids(project)]
+
+
+def bigwig_file(project, sample):
+    return os.path.join(OUT_DIR, project, "04_bigwig", f"{sample}.bw")
+
+
+def bigwig_files_for_project(project):
+    return [bigwig_file(project, sample) for sample in experiment_ids(project)]
+
+
+def merged_count_matrix(project):
+    return os.path.join(OUT_DIR, project, "03_merged_counts", f"{project}.tsv")
+
+
+def all_targets():
+    targets = []
+    for project in PROJECTS:
+        targets.append(merged_count_matrix(project))
+        targets.extend(count_files_for_project(project))
+        targets.extend(bigwig_files_for_project(project))
+    return targets
+
+
+rule all:
+    input:
+        all_targets()
+
+
+# 数据获取：SRA -> FASTQ
+rule data_conversion_single:
+    input:
+        lambda wildcards: sra_path(wildcards.project, wildcards.sra)
+    output:
+        temp(f"{OUT_DIR}/{{project}}/temp/{{sra}}.fastq")
+    wildcard_constraints:
+        project="[A-Za-z0-9_]+",
+        sra="[A-Za-z0-9]+"
+    conda:
+        "environment.yaml"
+    resources:
+        limit_dump=LIMIT_DUMP
+    shell:
+        "fasterq-dump {input} -O {OUT_DIR}/{wildcards.project}/temp"
+
+
+rule data_conversion_pair:
+    input:
+        lambda wildcards: sra_path(wildcards.project, wildcards.sra)
+    output:
+        temp(f"{OUT_DIR}/{{project}}/temp/{{sra}}_1.fastq"),
+        temp(f"{OUT_DIR}/{{project}}/temp/{{sra}}_2.fastq")
+    wildcard_constraints:
+        project="[A-Za-z0-9_]+",
+        sra="[A-Za-z0-9]+"
+    conda:
+        "environment.yaml"
+    resources:
+        limit_dump=LIMIT_DUMP
+    shell:
+        "fasterq-dump {input} -O {OUT_DIR}/{wildcards.project}/temp"
+
+
+# 合并同一样本的多个测序运行
+def merged_single_inputs(wildcards):
+    return [
+        f"{OUT_DIR}/{wildcards.project}/temp/{srr}.fastq"
+        for srr in runs_for_sample(wildcards.project, wildcards.sample)
+    ]
+
+
+def merged_r1_inputs(wildcards):
+    return [
+        f"{OUT_DIR}/{wildcards.project}/temp/{srr}_1.fastq"
+        for srr in runs_for_sample(wildcards.project, wildcards.sample)
+    ]
+
+
+def merged_r2_inputs(wildcards):
+    return [
+        f"{OUT_DIR}/{wildcards.project}/temp/{srr}_2.fastq"
+        for srr in runs_for_sample(wildcards.project, wildcards.sample)
+    ]
+
+
+rule merge_data:
+    input:
+        merged_single_inputs
+    output:
+        temp(f"{OUT_DIR}/{{project}}/00_raw_data/{{sample}}.fq")
+    wildcard_constraints:
+        project="[A-Za-z0-9_]+",
+        sample="[A-Za-z0-9]+"
+    resources:
+        limit_merge=LIMIT_MERGE
+    shell:
+        "cat {input} > {output}"
+
+
+rule merge_R1_data:
+    input:
+        merged_r1_inputs
+    output:
+        temp(f"{OUT_DIR}/{{project}}/00_raw_data/{{sample}}_R1.fq")
+    wildcard_constraints:
+        project="[A-Za-z0-9_]+",
+        sample="[A-Za-z0-9]+"
+    resources:
+        limit_merge=LIMIT_MERGE
+    shell:
+        "cat {input} > {output}"
+
+
+rule merge_R2_data:
+    input:
+        merged_r2_inputs
+    output:
+        temp(f"{OUT_DIR}/{{project}}/00_raw_data/{{sample}}_R2.fq")
+    wildcard_constraints:
+        project="[A-Za-z0-9_]+",
+        sample="[A-Za-z0-9]+"
+    resources:
+        limit_merge=LIMIT_MERGE
+    shell:
+        "cat {input} > {output}"
+
+
+# 质控
+rule data_clean_single:
+    input:
+        f"{OUT_DIR}/{{project}}/00_raw_data/{{sample}}.fq"
+    output:
+        temp(f"{OUT_DIR}/{{project}}/01_clean_data/{{sample}}.fq")
+    wildcard_constraints:
+        project="[A-Za-z0-9_]+",
+        sample="[A-Za-z0-9]+"
+    threads:
+        FASTP_THREADS
+    log:
+        json=f"{OUT_DIR}/{{project}}/log/fastp/{{sample}}.json",
+        html=f"{OUT_DIR}/{{project}}/log/fastp/{{sample}}.html",
+        logs=f"{OUT_DIR}/{{project}}/log/fastp/{{sample}}_fastp.log"
+    conda:
+        "environment.yaml"
+    shell:
+        """
+        mkdir -p $(dirname {log.json}) && \
+        fastp -w {threads} -i {input} -o {output} \
+            -j {log.json} -h {log.html} &> {log.logs}
+        """
+
+
+rule data_clean_pair:
+    input:
+        r1=f"{OUT_DIR}/{{project}}/00_raw_data/{{sample}}_R1.fq",
+        r2=f"{OUT_DIR}/{{project}}/00_raw_data/{{sample}}_R2.fq"
+    output:
+        r1=temp(f"{OUT_DIR}/{{project}}/01_clean_data/{{sample}}_R1.fq"),
+        r2=temp(f"{OUT_DIR}/{{project}}/01_clean_data/{{sample}}_R2.fq")
+    wildcard_constraints:
+        project="[A-Za-z0-9_]+",
+        sample="[A-Za-z0-9]+"
+    threads:
+        FASTP_THREADS
+    log:
+        json=f"{OUT_DIR}/{{project}}/log/fastp/{{sample}}.json",
+        html=f"{OUT_DIR}/{{project}}/log/fastp/{{sample}}.html",
+        logs=f"{OUT_DIR}/{{project}}/log/fastp/{{sample}}_fastp.log"
+    conda:
+        "environment.yaml"
+    shell:
+        """
+        mkdir -p $(dirname {log.json}) && \
+        fastp -w {threads} -i {input.r1} -I {input.r2} -o {output.r1} -O {output.r2} \
+            -j {log.json} -h {log.html} &> {log.logs}
+        """
+
+
+def clean_inputs(wildcards):
+    if is_paired(wildcards.project, wildcards.sample):
+        return [
+            os.path.join(OUT_DIR, wildcards.project, "01_clean_data", f"{wildcards.sample}_R1.fq"),
+            os.path.join(OUT_DIR, wildcards.project, "01_clean_data", f"{wildcards.sample}_R2.fq"),
+        ]
+    return [os.path.join(OUT_DIR, wildcards.project, "01_clean_data", f"{wildcards.sample}.fq")]
+
+
+# 比对并计数
+rule align_and_count:
+    input:
+        clean_inputs
+    output:
+        bam=temp(f"{OUT_DIR}/{{project}}/02_read_align/{{sample}}_Aligned.sortedByCoord.out.bam"),
+        counts=lambda wildcards: count_file(wildcards.project, wildcards.sample)
+    wildcard_constraints:
+        project="[A-Za-z0-9_]+",
+        sample="[A-Za-z0-9]+"
+    params:
+        index=config["star_index"],
+        prefix=lambda wildcards: wildcards.sample,
+        GTF=config["gtf"]
+    priority:
+        40
+    threads:
+        STAR_THREADS
+    resources:
+        mem_mb=lambda wildcards, attempt: 10000 if attempt == 1 else 60000 * (attempt - 1)
+    benchmark:
+        f"{OUT_DIR}/{{project}}/benchmark/STAR/{{sample}}.tsv"
+    conda:
+        "environment.yaml"
+    log:
+        f"{OUT_DIR}/{{project}}/log/{{sample}}_Log.final.out"
+    shell:
+        """
+        mkdir -p {OUT_DIR}/{wildcards.project}/log && \
+        STAR \
+            --genomeDir {params.index} \
+            --runThreadN {threads} \
+            --readFilesIn {input} \
+            --outFileNamePrefix {OUT_DIR}/{wildcards.project}/02_read_align/{params.prefix}_ \
+            --outSAMtype BAM SortedByCoordinate \
+            --outBAMsortingThreadN 10 \
+            --limitBAMsortRAM $(({resources.mem_mb} * 1000000)) \
+            --quantMode GeneCounts --sjdbGTFfile {params.GTF} \
+            --outTmpKeep None && \
+            mv {OUT_DIR}/{wildcards.project}/02_read_align/{params.prefix}_Log.final.out {log}
+        """
+
+
+rule build_bam_index:
+    input:
+        f"{OUT_DIR}/{{project}}/02_read_align/{{sample}}_Aligned.sortedByCoord.out.bam"
+    output:
+        temp(f"{OUT_DIR}/{{project}}/02_read_align/{{sample}}_Aligned.sortedByCoord.out.bam.bai")
+    wildcard_constraints:
+        project="[A-Za-z0-9_]+",
+        sample="[A-Za-z0-9]+"
+    conda:
+        "environment.yaml"
+    threads:
+        4
+    shell:
+        "samtools index -@ {threads} {input}"
+
+
+rule bamtobw:
+    input:
+        bam=f"{OUT_DIR}/{{project}}/02_read_align/{{sample}}_Aligned.sortedByCoord.out.bam",
+        bai=f"{OUT_DIR}/{{project}}/02_read_align/{{sample}}_Aligned.sortedByCoord.out.bam.bai"
+    output:
+        lambda wildcards: bigwig_file(wildcards.project, wildcards.sample)
+    wildcard_constraints:
+        project="[A-Za-z0-9_]+",
+        sample="[A-Za-z0-9]+"
+    params:
+        bs=BAMCOV_CFG.get("bin_size", 50),
+        gs=BAMCOV_CFG.get("genome_size", 2913022398),
+        norm=BAMCOV_CFG.get("normalize_using", "BPM")
+    conda:
+        "environment.yaml"
+    threads:
+        10
+    shell:
+        """
+        bamCoverage -p {threads} \
+            --binSize {params.bs} \
+            --effectiveGenomeSize {params.gs} \
+            --normalizeUsing {params.norm} \
+            -b {input.bam} -o {output}
+        """
+
+
+def counts_for_project(wildcards):
+    return count_files_for_project(wildcards.project)
+
+
+rule combine_count:
+    input:
+        counts_for_project
+    output:
+        lambda wildcards: merged_count_matrix(wildcards.project)
+    wildcard_constraints:
+        project="[A-Za-z0-9_]+"
+    priority:
+        35
+    run:
+        df = pd.read_csv(input[0], header=None, sep="\t", index_col=0)
+        df = df.iloc[:, [0]]
+        rename_dict = {1: os.path.basename(input[0]).replace("_ReadsPerGene.out.tab", "")}
+        df = df.rename(columns=rename_dict)
+        for file in input[1:]:
+            df2 = pd.read_csv(file, header=None, sep="\t", index_col=0)
+            df2 = df2.iloc[:, [0]]
+            rename_dict = {1: os.path.basename(file).replace("_ReadsPerGene.out.tab", "")}
+            df2 = df2.rename(columns=rename_dict)
+            df = df2.merge(df, left_index=True, right_index=True)
+        os.makedirs(os.path.dirname(output[0]), exist_ok=True)
+        df.to_csv(output[0], sep="\t", encoding="utf-8")
